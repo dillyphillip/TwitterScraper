@@ -15,8 +15,7 @@ MAX_TWEETS_DEFAULT = 10         # how many recent tweets to look at per profile
 # Monitor these profiles (URL, @handle, or username)
 USERS = [
     "https://x.com/TicTocTick",
-    # "anotherUser",
-    # "@thirdUser",
+    # "https://x.com/dillysnipe",
 ]
 
 # Discord (fill these in)
@@ -24,7 +23,6 @@ BOT_TOKEN  = "YOUR_DISCORD_BOT_TOKEN_HERE"
 CHANNEL_ID = "YOUR_DISCORD_CHANNEL_ID_HERE"
 # ------------------------------------------------
 
-# Optional: tidy console DataFrame display
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 120)
 pd.set_option("display.max_colwidth", 120)
@@ -118,8 +116,8 @@ def collect_tweets_from_page(page) -> List[Dict]:
 
         items.append({
             "id": status_id,
-            "url": href,
-            "created_at": ts,
+            "url": href,          # may be relative like "/user/status/123"
+            "created_at": ts,     # ISO string
             "text": text,
         })
     return items
@@ -131,7 +129,6 @@ def scrape_profile_df(ctx: BrowserContext, profile: str, max_tweets: int = MAX_T
     """
     username = parse_username(profile)
     if not username:
-        # Return empty DataFrame with correct columns
         return pd.DataFrame(columns=["id", "username", "created_at", "text", "url"])
 
     profile_url = f"https://x.com/{username}"
@@ -186,24 +183,37 @@ def scrape_profile_df(ctx: BrowserContext, profile: str, max_tweets: int = MAX_T
     df = df.drop_duplicates(subset=["id"]).sort_values("created_at", ascending=False).reset_index(drop=True)
     return df
 
+# ---- NEW: formatting helpers for message ----
+def format_created(ts: pd.Timestamp) -> str:
+    """
+    Render like 'September 19, 2025 at 18:40:44'.
+    (No timezone conversion; uses whatever tz the timestamp has.)
+    """
+    if pd.isna(ts):
+        return ""
+    try:
+        return ts.strftime("%B %d, %Y at %H:%M:%S")
+    except Exception:
+        return str(ts)
+
+def build_tweet_url(username: str, tweet_id: str, scraped_url: str) -> str:
+    """
+    Ensure we send a full 'https://x.com/...' URL to Discord.
+    Prefer reconstructing from username + id to avoid relative paths.
+    """
+    if scraped_url and scraped_url.startswith("http"):
+        return scraped_url
+    return f"https://x.com/{username}/status/{tweet_id}"
+
 # ------------- Monitor-many loop -------------
 def monitor_many(profiles: List[str],
                  interval_sec: int = INTERVAL_DEFAULT,
                  max_tweets: int = MAX_TWEETS_DEFAULT,
                  heartbeat: bool = False):
-    """
-    - Launch a single browser/context (logged in via STATE_FILE).
-    - Build a reference set of tweet IDs for each user.
-    - Every interval, re-scrape each profile:
-        * If new IDs appear, print and send to Discord.
-        * Update that user's reference set.
-    """
-    # Basic checks
     if not BOT_TOKEN or not CHANNEL_ID:
         print("Please set BOT_TOKEN and CHANNEL_ID before running.")
         sys.exit(1)
 
-    # Normalize user list to usernames
     usernames = [parse_username(p) for p in profiles if parse_username(p)]
     if not usernames:
         print("No valid profiles provided.")
@@ -233,14 +243,13 @@ def monitor_many(profiles: List[str],
 
                     if new_ids:
                         new_df = cur_df[cur_df["id"].isin(new_ids)].copy()
-                        # newest first when printing/posting
                         for _, row in new_df.sort_values("created_at", ascending=False).iterrows():
-                            created = row["created_at"]
-                            created_str = created.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(created) else ""
+                            created_str = format_created(row["created_at"])
+                            full_url = build_tweet_url(row["username"], row["id"], row["url"])
                             msg = (
-                                f"New tweet from {row['username']} at {created_str}:\n\n"
+                                f"New tweet from @{row['username']} at {created_str}:\n\n"
                                 f"{(row['text'] or '').strip()}\n\n"
-                                f"source: {row['url']}"
+                                f"source: {full_url}"
                             )
                             print(msg)
                             send_message(BOT_TOKEN, CHANNEL_ID, msg)
