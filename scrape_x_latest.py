@@ -1,16 +1,15 @@
-# scrape_x_latest_df.py
-import re
-import time
+# scrape_x_latest_df_mediaurls.py
+import re, time
 from urllib.parse import urlparse
 from typing import List, Dict, Optional
 
 import pandas as pd
+
 # ---------- Pandas display (optional) ----------
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
 pd.set_option('display.width', 1000)
 pd.set_option('display.max_colwidth', 50)
-
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -18,16 +17,50 @@ STATE_FILE = "x_state.json"          # created by save_login_state.py
 PROFILE    = "https://x.com/TicTocTick"
 MAX_TWEETS = 10
 EXPORT_CSV = "tweets_TicTocTick.csv"   # set to None to skip
-EXPORT_PARQUET = None                  # e.g., "tweets_TicTocTick.parquet"
 
 def extract_status_id(url: str) -> Optional[str]:
-    """Return the numeric status ID from a tweet URL, if present."""
     try:
         path = urlparse(url).path  # /<user>/status/<id>
         m = re.search(r"/status/(\d+)", path)
         return m.group(1) if m else None
     except Exception:
         return None
+
+def collect_media_urls(article) -> List[str]:
+    """Return a list of media URLs (photos, video/gif src or poster) for one tweet <article>."""
+    urls: List[str] = []
+
+    # Photos (pbs.twimg.com/media/...)
+    photos = article.locator("div[data-testid='tweetPhoto'] img[src]")
+    for i in range(photos.count()):
+        src = photos.nth(i).get_attribute("src") or ""
+        if src:
+            urls.append(src)
+
+    # Videos/GIFs (best-effort: direct <video> src or first <source>, else poster)
+    videos = article.locator("div[data-testid='videoPlayer'] video")
+    for i in range(videos.count()):
+        v = videos.nth(i)
+        src = ""
+        src_nodes = v.locator("source[src]")
+        if src_nodes.count() > 0:
+            src = src_nodes.nth(0).get_attribute("src") or ""
+        if not src:
+            src = v.get_attribute("src") or ""
+        poster = v.get_attribute("poster") or ""
+        if src:
+            urls.append(src)
+        elif poster:
+            urls.append(poster)
+
+    # Dedup while preserving order
+    seen = set()
+    out = []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 def collect_tweets_from_page(page) -> List[Dict]:
     """Collect tweet metadata from currently loaded DOM."""
@@ -61,56 +94,52 @@ def collect_tweets_from_page(page) -> List[Dict]:
             except Exception:
                 text = ""
 
-        # Timestamp (ISO 8601 if available)
+        # Timestamp
         ts = ""
         tnode = a.locator("time").first
         if tnode.count() > 0:
             ts = tnode.get_attribute("datetime") or ""
 
+        # Media URLs
+        media_urls = collect_media_urls(a)
+
         items.append({
             "id": status_id,
             "url": href,
             "created_at": ts,
-            "text": text
+            "text": text,
+            "media_urls": media_urls
         })
     return items
 
 def scrape_to_dataframe(profile_url: str = PROFILE,
                         state_file: str = STATE_FILE,
                         max_tweets: int = MAX_TWEETS) -> pd.DataFrame:
-    """Scrape latest tweets and return a pandas DataFrame."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(storage_state=state_file)
 
-        # Block heavy assets for speed
-        def _route(route):
-            r = route.request
-            if r.resource_type in {"image", "media", "font"}:
-                return route.abort()
-            return route.continue_()
-        ctx.route("**/*", _route)
-
+        # IMPORTANT: allow images so <img src> exists (don’t abort images here)
+        # If you previously blocked images for speed, remove that route.
         page = ctx.new_page()
         page.goto(profile_url, wait_until="domcontentloaded")
 
-        # If protected & you’re not approved, no posts will be visible
+        # Protected account check
         try:
             protected = page.locator("text=posts are protected").first
             if protected.is_visible():
                 browser.close()
-                return pd.DataFrame(columns=["id","username","created_at","text","url"])
+                return pd.DataFrame(columns=["id","username","created_at","text","url","media_urls","has_media"])
         except PWTimeout:
             pass
 
-        # Wait for at least one tweet
         try:
             page.locator('article[data-testid="tweet"]').first.wait_for(timeout=8000)
         except PWTimeout:
             browser.close()
-            return pd.DataFrame(columns=["id","username","created_at","text","url"])
+            return pd.DataFrame(columns=["id","username","created_at","text","url","media_urls","has_media"])
 
-        # Scroll & collect until we have enough
+        # Scroll & collect
         seen = set()
         items: List[Dict] = []
 
@@ -133,27 +162,20 @@ def scrape_to_dataframe(profile_url: str = PROFILE,
 
         browser.close()
 
-    # Build DataFrame
     username = urlparse(profile_url).path.strip("/").split("/")[0] or "unknown"
     df = pd.DataFrame(items[:max_tweets])
     if df.empty:
-        # Ensure consistent columns even if empty
-        return pd.DataFrame(columns=["id","username","created_at","text","url"])
+        return pd.DataFrame(columns=["id","username","created_at","text","url","media_urls","has_media"])
 
-    df.insert(1, "username", username)               # add username column
+    df.insert(1, "username", username)
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    df["has_media"] = df["media_urls"].apply(lambda xs: bool(xs))
     df = df.drop_duplicates(subset=["id"]).sort_values("created_at", ascending=False).reset_index(drop=True)
-
     return df
 
 if __name__ == "__main__":
     df = scrape_to_dataframe()
-    print(df[["id","username","created_at","text","url"]])
-
-    # Optional exports
+    print(df[["id","username","created_at","has_media","media_urls","url"]])
     if EXPORT_CSV:
         df.to_csv(EXPORT_CSV, index=False)
         print(f"\nSaved CSV -> {EXPORT_CSV}")
-    if EXPORT_PARQUET:
-        df.to_parquet(EXPORT_PARQUET, index=False)
-        print(f"Saved Parquet -> {EXPORT_PARQUET}")
