@@ -9,7 +9,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Brow
 
 # ------------------- Config -------------------
 STATE_FILE = "x_state.json"     # created by save_login_state.py (manual login -> saved state)
-INTERVAL_DEFAULT = 15           # seconds between polls
+INTERVAL_DEFAULT = 15           # seconds between polls of each profile
 MAX_TWEETS_DEFAULT = 10         # how many recent tweets to look at per profile
 
 # Monitor these profiles (URL, @handle, or username)
@@ -21,36 +21,104 @@ USERS = [
 # Discord (fill these in)
 BOT_TOKEN  = "YOUR_DISCORD_BOT_TOKEN_HERE"
 CHANNEL_ID = "YOUR_DISCORD_CHANNEL_ID_HERE"
+
+# Discord pacing
+POST_DELAY_SEC = 1.0            # courtesy delay between successful messages
+MAX_DISCORD_RETRIES = 3         # retry count when hitting 429
 # ------------------------------------------------
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 120)
 pd.set_option("display.max_colwidth", 120)
 
-# ------------- Discord send -------------
-def send_message(token: str, channel_id: str, content: str):
+# Keep simple per-channel next-allowed-send timestamp
+_CHANNEL_NEXT_ALLOWED: Dict[str, float] = {}
+
+# ------------- Discord send (rate-limit aware) -------------
+def _respect_bucket_after_success(channel_id: str, headers: Dict[str, str]):
+    """
+    If Discord says remaining=0, wait until reset; otherwise apply courtesy POST_DELAY_SEC.
+    """
+    try:
+        remaining = headers.get("X-RateLimit-Remaining")
+        reset_after = headers.get("X-RateLimit-Reset-After")
+        if remaining is not None and int(remaining) <= 0 and reset_after:
+            wait_for = float(reset_after)
+            _CHANNEL_NEXT_ALLOWED[channel_id] = max(_CHANNEL_NEXT_ALLOWED.get(channel_id, 0.0), time.time() + wait_for)
+            return
+    except Exception:
+        pass
+    # default small spacing
+    _CHANNEL_NEXT_ALLOWED[channel_id] = max(_CHANNEL_NEXT_ALLOWED.get(channel_id, 0.0), time.time() + POST_DELAY_SEC)
+
+def _sleep_until_allowed(channel_id: str):
+    t = _CHANNEL_NEXT_ALLOWED.get(channel_id, 0.0)
+    now = time.time()
+    if now < t:
+        time.sleep(t - now)
+
+def send_message(token: str, channel_id: str, content: str) -> bool:
     if not token or not channel_id:
         print("Discord token or channel_id missing. Skipping message send.")
-        return
+        return False
+
+    # Discord hard cap is ~2000 chars; trim to be safe
+    if len(content) > 1900:
+        content = content[:1900] + "\n...[truncated]"
+
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     headers = {
         "Authorization": f"Bot {token}",
         "Content-Type": "application/json",
     }
     payload = {"content": content}
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+
+    for attempt in range(1, MAX_DISCORD_RETRIES + 1):
+        _sleep_until_allowed(channel_id)
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        except Exception as e:
+            print(f"Error sending message (attempt {attempt}): {e}")
+            time.sleep(POST_DELAY_SEC)
+            continue
+
         if resp.status_code in (200, 201):
             print("Message sent successfully!")
-        else:
-            print(f"Failed to send message: {resp.status_code}")
+            _respect_bucket_after_success(channel_id, resp.headers or {})
+            # extra courtesy delay between posts
+            time.sleep(POST_DELAY_SEC)
+            return True
+
+        if resp.status_code == 429:
+            # Respect Discord's retry suggestion precisely
+            retry_after = None
             try:
-                print(f"Error details: {resp.json()}")
+                data = resp.json()
+                retry_after = data.get("retry_after")
             except Exception:
-                print("No JSON error body.")
-            print("Check token, channel ID, and bot permissions.")
-    except Exception as e:
-        print(f"Error sending message: {e}")
+                pass
+            if retry_after is None:
+                retry_after = resp.headers.get("Retry-After") or resp.headers.get("X-RateLimit-Reset-After") or 1.0
+            try:
+                retry_after = float(retry_after)
+            except Exception:
+                retry_after = 1.0
+            print(f"429: rate limited. Waiting {retry_after:.2f}s (attempt {attempt}/{MAX_DISCORD_RETRIES})…")
+            _CHANNEL_NEXT_ALLOWED[channel_id] = time.time() + retry_after
+            time.sleep(retry_after + 0.05)
+            continue  # retry
+
+        # Other error
+        print(f"Failed to send message: {resp.status_code}")
+        try:
+            print(f"Error details: {resp.json()}")
+        except Exception:
+            print("No JSON error body.")
+        time.sleep(POST_DELAY_SEC)
+        return False
+
+    print("Giving up after retries due to rate limits or errors.")
+    return False
 
 # ------------- Helpers / scraping core -------------
 def parse_username(profile: str) -> str:
@@ -76,7 +144,7 @@ def extract_status_id(url: str) -> Optional[str]:
 def collect_tweets_from_page(page) -> List[Dict]:
     """
     Scrape the currently-loaded profile page for tweets (articles).
-    Returns a list of dicts with id, url, created_at (ISO), text.
+    Returns a list of dicts with id, url (may be relative), created_at (ISO), text.
     """
     items = []
     articles = page.locator('article[data-testid="tweet"]')
@@ -85,7 +153,7 @@ def collect_tweets_from_page(page) -> List[Dict]:
     for i in range(count):
         a = articles.nth(i)
 
-        # Grab a status link to derive ID/URL
+        # status link -> derive ID + URL
         status_link = a.locator("a[href*='/status/']").first
         if status_link.count() == 0:
             continue
@@ -94,7 +162,7 @@ def collect_tweets_from_page(page) -> List[Dict]:
         if not status_id:
             continue
 
-        # Text (best-effort)
+        # Text
         text = ""
         tx = a.locator("div[data-testid='tweetText']")
         if tx.count() > 0:
@@ -183,12 +251,9 @@ def scrape_profile_df(ctx: BrowserContext, profile: str, max_tweets: int = MAX_T
     df = df.drop_duplicates(subset=["id"]).sort_values("created_at", ascending=False).reset_index(drop=True)
     return df
 
-# ---- NEW: formatting helpers for message ----
+# ---- formatting helpers for message ----
 def format_created(ts: pd.Timestamp) -> str:
-    """
-    Render like 'September 19, 2025 at 18:40:44'.
-    (No timezone conversion; uses whatever tz the timestamp has.)
-    """
+    """Render like 'September 19, 2025 at 18:40:44'."""
     if pd.isna(ts):
         return ""
     try:
@@ -197,10 +262,7 @@ def format_created(ts: pd.Timestamp) -> str:
         return str(ts)
 
 def build_tweet_url(username: str, tweet_id: str, scraped_url: str) -> str:
-    """
-    Ensure we send a full 'https://x.com/...' URL to Discord.
-    Prefer reconstructing from username + id to avoid relative paths.
-    """
+    """Ensure we send a full 'https://x.com/...' URL to Discord."""
     if scraped_url and scraped_url.startswith("http"):
         return scraped_url
     return f"https://x.com/{username}/status/{tweet_id}"
